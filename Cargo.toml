@@ -1,0 +1,13 @@
+[package]
+name = "vectorize-rs"
+version = "0.1.0"
+edition = "2024"
+description = "Fast local text embeddings for Rust"
+license = "Apache-2.0"
+repository = "https://github.com/olafurjohannsson/vectorize"
+keywords = ["embeddings", "nlp", "vector", "ai", "text"]
+categories = ["science", "text-processing"]
+
+
+
+[dependencies]
