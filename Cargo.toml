@@ -2,28 +2,26 @@
 name = "vectorize-rs"
 version = "0.1.0"
 edition = "2024"
-authors = ["Ólafur Aron Jóhannsson <olafurjohannss@gmail.com>"]
-description = "Simple, fast local text embeddings for Rust"
-license = "Apache-2.0"
-repository = "https://github.com/olafurjohannss/vectorize-rs"
+authors = ["Ólafur Aron Jóhannsson"]
 
 [dependencies]
-thiserror = "1.0"
 serde = { version = "1.0", features = ["derive"] }
-ort = "2.0.0-rc.10"
-tokio = { version = "1.47.1", features = ["full"] }
-reqwest = { version = "0.12.23", features = ["json"] }
-futures = "0.3.31"
-tokenizers = "0.21.4"
-wasm-bindgen = { version = "0.2.100", optional = true }
-js-sys = { version = "0.3.77", optional = true }
-web-sys = { version = "0.3.77", optional = true }
+serde_json = "1.0"
+anyhow = "1.0"
+tokenizers = { version = "0.15", default-features = false, features = ["onig"] }
+tokio = { version = "1.47.1" , features = ["full"] }
 
-[dev-dependencies]
-tokio-test = "0.4"
+# Tensor storage
+safetensors = "0.4"
+ndarray = "0.15"
+
+# WASM support
+wasm-bindgen = "0.2"
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
+web-sys = "0.3"
 
 [lib]
 crate-type = ["cdylib", "rlib"]
-
-[features]
-wasm = ["wasm-bindgen", "js-sys", "web-sys"]
