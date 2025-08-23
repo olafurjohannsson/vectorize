@@ -1,16 +1,16 @@
 use anyhow::Result;
 use tokenizers::Tokenizer;
 
-pub mod tensor;
 pub mod models;
+pub mod tensor;
 pub mod weights;
 
 #[cfg(target_arch = "wasm32")]
 pub mod wasm;
 
 use models::{EmbeddingModel, ModelFactory};
-use weights::ModelWeights;
 use tensor::Tensor;
+use weights::ModelWeights;
 
 pub struct Vectorizer {
     model: Box<dyn EmbeddingModel>,
@@ -32,7 +32,8 @@ impl Vectorizer {
     }
 
     pub fn encode(&self, texts: Vec<&str>) -> Result<Vec<Vec<f32>>> {
-        let encodings = self.tokenizer
+        let encodings = self
+            .tokenizer
             .encode_batch(texts, true)
             .map_err(|e| anyhow::anyhow!("Tokenization failed: {}", e))?;
 
@@ -45,9 +46,20 @@ impl Vectorizer {
 
     fn prepare_inputs(&self, encodings: Vec<tokenizers::Encoding>) -> (Tensor, Tensor) {
         let batch_size = encodings.len();
-        let max_len = encodings.iter().map(|e| e.len()).max().unwrap_or(0);
+        if batch_size == 0 {
+            return (Tensor::zeros(vec![0, 0]), Tensor::zeros(vec![0, 0]));
+        }
 
-        // flatten vectors for input_ids and attention_mask
+
+        let max_len = encodings.iter().map(|e| e.len()).max().unwrap_or(0);
+        println!("Batch size: {}, Max length: {}", batch_size, max_len);
+
+        for (i, encoding) in encodings.iter().enumerate() {
+            let ids = encoding.get_ids();
+            let mask = encoding.get_attention_mask();
+            println!("Text {}: {} tokens, first 10 IDs: {:?}",
+                     i, ids.len(), &ids[..ids.len().min(10)]);
+        }
         let mut input_ids_data = Vec::with_capacity(batch_size * max_len);
         let mut attention_mask_data = Vec::with_capacity(batch_size * max_len);
 
@@ -55,14 +67,17 @@ impl Vectorizer {
             let ids = encoding.get_ids();
             let mask = encoding.get_attention_mask();
 
-            // Add the actual ids
-            input_ids_data.extend(ids.iter().map(|&id| id as f32));
-            attention_mask_data.extend(mask.iter().map(|&m| m as f32));
-
-            // Pad to max_len if needed
-            let padding_needed = max_len - ids.len();
-            input_ids_data.extend(vec![0.0; padding_needed]);
-            attention_mask_data.extend(vec![0.0; padding_needed]);
+            // Add the actual ids and mask values
+            for i in 0..max_len {
+                if i < ids.len() {
+                    input_ids_data.push(ids[i] as f32);
+                    attention_mask_data.push(mask[i] as f32);
+                } else {
+                    // Padding
+                    input_ids_data.push(0.0);
+                    attention_mask_data.push(0.0);
+                }
+            }
         }
 
         // Create tensors with shape [batch_size, max_len]

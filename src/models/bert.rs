@@ -1,7 +1,7 @@
-use crate::tensor::Tensor;
 use crate::models::ModelConfig;
+use crate::models::components::{ActivationFunction, Embedding, LayerNorm, Linear};
+use crate::tensor::Tensor;
 use crate::weights::ModelWeights;
-use crate::models::components::{ActivationFunction, Linear, Embedding, LayerNorm};
 
 pub struct BertModel {
     embeddings: BertEmbeddings,
@@ -83,21 +83,50 @@ impl BertModel {
     }
 
     fn forward(&self, input_ids: &Tensor, attention_mask: &Tensor) -> Tensor {
-        // get embeddings
         let embedding_output = self.embeddings.forward(input_ids, None);
 
-        // encoder uass through
-        let encoder_output = self.encoder.forward(embedding_output, Some(attention_mask));
+        // Prepare attention mask for all layers
+        // Convert from [batch, seq_len] with 1s and 0s
+        // to extended attention mask for adding to attention scores
+        let extended_attention_mask = self.get_extended_attention_mask(attention_mask);
 
-        // mean pooling for sentence embeddings
+        // Pass through encoder
+        let encoder_output = self
+            .encoder
+            .forward(embedding_output, Some(&extended_attention_mask));
+
+        // Mean pooling for sentence embeddings
         self.mean_pooling(encoder_output, attention_mask)
     }
 
+    fn get_extended_attention_mask(&self, attention_mask: &Tensor) -> Tensor {
+        attention_mask.clone()
+    }
+
     fn mean_pooling(&self, hidden_states: Tensor, attention_mask: &Tensor) -> Tensor {
-        // mask padding tokens
-        let input_mask_expanded = attention_mask.unsqueeze(-1).expand_as(&hidden_states);
-        let sum_embeddings = hidden_states.mul(&input_mask_expanded).sum(&[-1], false);
-        let sum_mask = input_mask_expanded.sum(&[-1], false).clamp_min(1e-9);
+        // hidden_states: [batch_size, seq_len, hidden_size]
+        // attention_mask: [batch_size, seq_len]
+        println!("hidden_states shape: {:?}", hidden_states.shape());
+        println!("attention_mask shape: {:?}", attention_mask.shape());
+        // We need to expand attention_mask from [batch, seq] to [batch, seq, hidden]
+        //  add a dimension: [batch, seq] -> [batch, seq, 1]
+        let mask_expanded = attention_mask.unsqueeze(-1);
+        println!("mask_expanded after unsqueeze: {:?}", mask_expanded.shape());
+        // broadcast [batch, seq, 1] -> [batch, seq, hidden_size]
+        let hidden_size = hidden_states.shape()[2];
+        let batch_size = hidden_states.shape()[0];
+        let seq_len = hidden_states.shape()[1];
+
+        let mask_expanded = mask_expanded.broadcast_to(&[batch_size, seq_len, hidden_size]);
+
+        // mask and sum over sequence dimension
+        let masked = hidden_states.mul(&mask_expanded);
+        let sum_embeddings = masked.sum(&[1], false); // Sum over seq_len dimension
+
+        // denominator (sum of mask) for averaging
+        let sum_mask = mask_expanded.sum(&[1], false).clamp_min(1e-9);
+
+        // Divide to get mean
         sum_embeddings.div(&sum_mask)
     }
 }
@@ -126,13 +155,19 @@ impl BertEmbeddings {
     fn new(weights: &ModelWeights, config: &ModelConfig) -> Self {
         Self {
             word_embeddings: Embedding::new(
-                weights.get_tensor("embeddings.word_embeddings.weight").clone(),
+                weights
+                    .get_tensor("embeddings.word_embeddings.weight")
+                    .clone(),
             ),
             position_embeddings: Embedding::new(
-                weights.get_tensor("embeddings.position_embeddings.weight").clone(),
+                weights
+                    .get_tensor("embeddings.position_embeddings.weight")
+                    .clone(),
             ),
             token_type_embeddings: Embedding::new(
-                weights.get_tensor("embeddings.token_type_embeddings.weight").clone(),
+                weights
+                    .get_tensor("embeddings.token_type_embeddings.weight")
+                    .clone(),
             ),
             layer_norm: LayerNorm::new(
                 weights.get_tensor("embeddings.LayerNorm.weight").clone(),
@@ -144,27 +179,41 @@ impl BertEmbeddings {
     }
 
     fn forward(&self, input_ids: &Tensor, token_type_ids: Option<&Tensor>) -> Tensor {
+        // input_ids: [batch_size, seq_length]
+        let batch_size = input_ids.shape()[0];
         let seq_length = input_ids.shape()[1];
 
-        // word embeddings
+        // Get word embeddings: [batch_size, seq_length, hidden_size]
         let inputs_embeds = self.word_embeddings.forward(input_ids);
 
-        // position IDs [0, 1, 2, ..., seq_length-1]
+        // Create position IDs [seq_length] and broadcast for batch
         let position_ids = Tensor::arange(0, seq_length as i64);
+        // Expand to [batch_size, seq_length] if needed
+        let position_ids = if batch_size > 1 {
+            position_ids
+                .unsqueeze(0)
+                .broadcast_to(&[batch_size, seq_length])
+        } else {
+            position_ids.unsqueeze(0)
+        };
         let position_embeddings = self.position_embeddings.forward(&position_ids);
 
+        // Token type embeddings (0 for single sentence)
         let zeros_tensor;
         let token_type_ids = if let Some(ids) = token_type_ids {
             ids
         } else {
-            zeros_tensor = Tensor::zeros_like(input_ids);
+            zeros_tensor = Tensor::zeros(vec![batch_size, seq_length]);
             &zeros_tensor
         };
         let token_type_embeddings = self.token_type_embeddings.forward(token_type_ids);
 
-        let embeddings = inputs_embeds.add(&position_embeddings).add(&token_type_embeddings);
+        // Add all embeddings together
+        let embeddings = inputs_embeds
+            .add(&position_embeddings)
+            .add(&token_type_embeddings);
 
-        // apply layer norm
+        // Apply layer norm
         self.layer_norm.forward(&embeddings)
     }
 }
@@ -183,8 +232,14 @@ impl BertLayer {
 
     fn forward(&self, hidden_states: &Tensor, attention_mask: Option<&Tensor>) -> Tensor {
         // Self attention
-        let attention_output = self.attention.self_attention.forward(hidden_states, attention_mask);
-        let attention_output = self.attention.output.forward(&attention_output, hidden_states);
+        let attention_output = self
+            .attention
+            .self_attention
+            .forward(hidden_states, attention_mask);
+        let attention_output = self
+            .attention
+            .output
+            .forward(&attention_output, hidden_states);
 
         // Feed forward
         let intermediate_output = self.intermediate.forward(&attention_output);
@@ -204,16 +259,26 @@ impl BertSelfAttention {
 
         Self {
             query: Linear::new(
-                weights.get_tensor(&format!("{}.query.weight", prefix)).clone(),
-                weights.get_tensor(&format!("{}.query.bias", prefix)).clone(),
+                weights
+                    .get_tensor(&format!("{}.query.weight", prefix))
+                    .clone(),
+                weights
+                    .get_tensor(&format!("{}.query.bias", prefix))
+                    .clone(),
             ),
             key: Linear::new(
-                weights.get_tensor(&format!("{}.key.weight", prefix)).clone(),
+                weights
+                    .get_tensor(&format!("{}.key.weight", prefix))
+                    .clone(),
                 weights.get_tensor(&format!("{}.key.bias", prefix)).clone(),
             ),
             value: Linear::new(
-                weights.get_tensor(&format!("{}.value.weight", prefix)).clone(),
-                weights.get_tensor(&format!("{}.value.bias", prefix)).clone(),
+                weights
+                    .get_tensor(&format!("{}.value.weight", prefix))
+                    .clone(),
+                weights
+                    .get_tensor(&format!("{}.value.bias", prefix))
+                    .clone(),
             ),
             num_attention_heads,
             attention_head_size,
@@ -221,27 +286,48 @@ impl BertSelfAttention {
     }
 
     fn forward(&self, hidden_states: &Tensor, attention_mask: Option<&Tensor>) -> Tensor {
-
+        // Linear projections
         let query_layer = self.transpose_for_scores(&self.query.forward(hidden_states));
         let key_layer = self.transpose_for_scores(&self.key.forward(hidden_states));
         let value_layer = self.transpose_for_scores(&self.value.forward(hidden_states));
 
-        // attention
-        let attention_scores = query_layer.matmul(&key_layer.transpose(-1, -2));
-        let attention_scores = attention_scores.div_scalar((self.attention_head_size as f32).sqrt());
+        // query_layer, key_layer, value_layer: [batch, num_heads, seq_len, head_size]
 
-        // Apply attention mask if provided
+        // Attention scores: [batch, num_heads, seq_len, seq_len]
+        let attention_scores = query_layer.matmul(&key_layer.transpose(-1, -2));
+        let attention_scores =
+            attention_scores.div_scalar((self.attention_head_size as f32).sqrt());
+
         let attention_scores = if let Some(mask) = attention_mask {
-            attention_scores.add(&mask.mul_scalar(-10000.0))
+            // mask is [batch, seq_len]
+            //  reshape it to [batch, 1, 1, seq_len] for broadcasting
+            //broadcast to [batch, num_heads, seq_len, seq_len]
+
+            // First, expand mask from [batch, seq_len] to [batch, 1, 1, seq_len]
+            let mask_expanded = mask
+                .unsqueeze(1) // [batch, 1, seq_len]
+                .unsqueeze(2); // [batch, 1, 1, seq_len]
+
+            // Create attention mask values: 0 for valid, -10000 for invalid
+            // Assuming mask has 1 for valid positions and 0 for padding
+            let mask_value = mask_expanded
+                .mul_scalar(-1.0)
+                .add_scalar(1.0)
+                .mul_scalar(-10000.0);
+
+            // Add mask to attention scores
+            attention_scores.add(&mask_value)
         } else {
             attention_scores
         };
 
-        // normalize softmax
+        // Normalize with softmax
         let attention_probs = attention_scores.softmax(-1);
-        // apply attention
+
+        // Apply attention to values
         let context_layer = attention_probs.matmul(&value_layer);
-        // Reshape
+
+        // Reshape back
         self.transpose_from_scores(&context_layer)
     }
 
@@ -259,8 +345,11 @@ impl BertSelfAttention {
         let batch_size = shape[0];
         let seq_len = shape[2];
 
-        x.transpose(-2, -3)
-            .reshape(&[batch_size, seq_len, self.num_attention_heads * self.attention_head_size])
+        x.transpose(-2, -3).reshape(&[
+            batch_size,
+            seq_len,
+            self.num_attention_heads * self.attention_head_size,
+        ])
     }
 }
 
@@ -270,12 +359,20 @@ impl BertSelfOutput {
 
         Self {
             dense: Linear::new(
-                weights.get_tensor(&format!("{}.dense.weight", prefix)).clone(),
-                weights.get_tensor(&format!("{}.dense.bias", prefix)).clone(),
+                weights
+                    .get_tensor(&format!("{}.dense.weight", prefix))
+                    .clone(),
+                weights
+                    .get_tensor(&format!("{}.dense.bias", prefix))
+                    .clone(),
             ),
             layer_norm: LayerNorm::new(
-                weights.get_tensor(&format!("{}.LayerNorm.weight", prefix)).clone(),
-                weights.get_tensor(&format!("{}.LayerNorm.bias", prefix)).clone(),
+                weights
+                    .get_tensor(&format!("{}.LayerNorm.weight", prefix))
+                    .clone(),
+                weights
+                    .get_tensor(&format!("{}.LayerNorm.bias", prefix))
+                    .clone(),
                 config.layer_norm_eps,
             ),
         }
@@ -294,8 +391,12 @@ impl BertIntermediate {
 
         Self {
             dense: Linear::new(
-                weights.get_tensor(&format!("{}.dense.weight", prefix)).clone(),
-                weights.get_tensor(&format!("{}.dense.bias", prefix)).clone(),
+                weights
+                    .get_tensor(&format!("{}.dense.weight", prefix))
+                    .clone(),
+                weights
+                    .get_tensor(&format!("{}.dense.bias", prefix))
+                    .clone(),
             ),
             intermediate_act_fn: ActivationFunction::from_str(&config.hidden_act),
         }
@@ -313,12 +414,20 @@ impl BertOutput {
 
         Self {
             dense: Linear::new(
-                weights.get_tensor(&format!("{}.dense.weight", prefix)).clone(),
-                weights.get_tensor(&format!("{}.dense.bias", prefix)).clone(),
+                weights
+                    .get_tensor(&format!("{}.dense.weight", prefix))
+                    .clone(),
+                weights
+                    .get_tensor(&format!("{}.dense.bias", prefix))
+                    .clone(),
             ),
             layer_norm: LayerNorm::new(
-                weights.get_tensor(&format!("{}.LayerNorm.weight", prefix)).clone(),
-                weights.get_tensor(&format!("{}.LayerNorm.bias", prefix)).clone(),
+                weights
+                    .get_tensor(&format!("{}.LayerNorm.weight", prefix))
+                    .clone(),
+                weights
+                    .get_tensor(&format!("{}.LayerNorm.bias", prefix))
+                    .clone(),
                 config.layer_norm_eps,
             ),
         }

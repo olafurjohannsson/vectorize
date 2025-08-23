@@ -1,5 +1,5 @@
+use std::ops::{Add, Div, Mul, Range, Sub};
 use std::sync::Arc;
-use std::ops::{Range, Div, Mul, Add, Sub};
 
 #[derive(Clone, Debug)]
 pub struct Tensor {
@@ -46,12 +46,39 @@ impl Tensor {
         let size = shape.iter().product();
         Self::from_vec(vec![value; size], shape)
     }
+    pub fn normalize(&self) -> Tensor {
+        // Normalize along last dimension
+        let last_dim = self.shape[self.shape.len() - 1];
+        let mut result = Vec::with_capacity(self.data.len());
 
+        // Process each vector
+        let num_vectors = self.data.len() / last_dim;
+        for i in 0..num_vectors {
+            let start = i * last_dim;
+            let end = start + last_dim;
+            let vector = &self.data[start..end];
+
+            // Calculate L2 norm
+            let norm: f32 = vector.iter().map(|x| x * x).sum::<f32>().sqrt();
+            let norm = norm.max(1e-12); // Avoid division by zero
+
+            // Normalize
+            for &val in vector {
+                result.push(val / norm);
+            }
+        }
+
+        Self::from_vec(result, self.shape.clone())
+    }
     pub fn reshape(&self, new_shape: &[usize]) -> Tensor {
         // Verify the total size matches
         let total_size: usize = self.shape.iter().product();
         let new_size: usize = new_shape.iter().product();
-        assert_eq!(total_size, new_size, "Cannot reshape tensor of size {} to size {}", total_size, new_size);
+        assert_eq!(
+            total_size, new_size,
+            "Cannot reshape tensor of size {} to size {}",
+            total_size, new_size
+        );
 
         Self::from_vec(self.data.to_vec(), new_shape.to_vec())
     }
@@ -86,7 +113,8 @@ impl Tensor {
             let old_idx = self.unravel_index(i);
             let mut new_idx = old_idx.clone();
             new_idx.swap(dim0, dim1);
-            let new_flat_idx = self.ravel_index(&new_idx, &new_shape, &Self::compute_strides(&new_shape));
+            let new_flat_idx =
+                self.ravel_index(&new_idx, &new_shape, &Self::compute_strides(&new_shape));
             result[new_flat_idx] = self.data[i];
         }
 
@@ -95,15 +123,32 @@ impl Tensor {
 
     pub fn unsqueeze(&self, dim: i32) -> Tensor {
         let mut new_shape = self.shape.clone();
-        let ndim = self.shape.len() as i32;
-        let dim = if dim < 0 { ndim + dim + 1 } else { dim } as usize;
+        let ndim = (self.shape.len() + 1) as i32;
+        let dim = if dim < 0 {
+            (ndim + dim) as usize
+        } else {
+            dim as usize
+        };
+
+        if dim > self.shape.len() {
+            panic!(
+                "Dimension {} out of range for tensor with {} dimensions",
+                dim,
+                self.shape.len()
+            );
+        }
+
         new_shape.insert(dim, 1);
         self.reshape(&new_shape)
     }
 
     pub fn squeeze(&self, dim: Option<i32>) -> Tensor {
         let new_shape = if let Some(d) = dim {
-            let d = if d < 0 { self.shape.len() as i32 + d } else { d } as usize;
+            let d = if d < 0 {
+                self.shape.len() as i32 + d
+            } else {
+                d
+            } as usize;
             let mut shape = self.shape.clone();
             if shape[d] == 1 {
                 shape.remove(d);
@@ -116,35 +161,64 @@ impl Tensor {
     }
 
     pub fn expand_as(&self, other: &Tensor) -> Tensor {
-        self.broadcast_to(&other.shape)
+        // For attention mask: [batch, seq_len, 1] -> [batch, seq_len, hidden_size]
+        if self.shape.len() == other.shape.len() {
+            return self.broadcast_to(&other.shape);
+        } else if self.shape.len() < other.shape.len() {
+            // Add dimensions as needed
+            let mut expanded = self.clone();
+            while expanded.shape.len() < other.shape.len() {
+                expanded = expanded.unsqueeze(-1);
+            }
+            return expanded.broadcast_to(&other.shape);
+        }
+        panic!("Cannot expand {:?} to {:?}", self.shape, other.shape);
     }
 
     pub fn broadcast_to(&self, target_shape: &[usize]) -> Tensor {
-        assert_eq!(self.shape.len(), target_shape.len(), "Shapes must have same number of dimensions");
+        assert_eq!(
+            self.shape.len(),
+            target_shape.len(),
+            "broadcast_to requires same number of dimensions. Got {:?} and {:?}",
+            self.shape,
+            target_shape
+        );
 
         let mut result = self.clone();
-        for (i, (&src_dim, &tgt_dim)) in self.shape.iter().zip(target_shape.iter()).enumerate() {
-            if src_dim != tgt_dim {
-                assert_eq!(src_dim, 1, "Can only broadcast dimension of size 1");
-                // Repeat along this dimension
-                let mut new_data = Vec::with_capacity(result.data.len() * tgt_dim);
-                let outer_size: usize = result.shape[..i].iter().product();
-                let inner_size: usize = result.shape[i+1..].iter().product();
 
-                for outer in 0..outer_size {
-                    for _ in 0..tgt_dim {
-                        for inner in 0..inner_size {
-                            let idx = outer * inner_size + inner;
-                            new_data.push(result.data[idx]);
-                        }
+        for (i, (&src_dim, &tgt_dim)) in self.shape.iter().zip(target_shape.iter()).enumerate() {
+            if src_dim == tgt_dim {
+                continue;
+            }
+
+            if src_dim != 1 {
+                panic!(
+                    "Cannot broadcast dimension {} from {} to {}. Source shape: {:?}, target: {:?}",
+                    i, src_dim, tgt_dim, self.shape, target_shape
+                );
+            }
+
+            // Broadcast this dimension from 1 to tgt_dim
+            let outer_size: usize = result.shape[..i].iter().product();
+            let inner_size: usize = result.shape[i + 1..].iter().product();
+
+            let old_data = result.data.to_vec();
+            let mut new_data = Vec::with_capacity(outer_size * tgt_dim * inner_size);
+
+            for outer_idx in 0..outer_size {
+                for _ in 0..tgt_dim {
+                    for inner_idx in 0..inner_size {
+                        let idx = outer_idx * inner_size + inner_idx;
+                        new_data.push(old_data[idx]);
                     }
                 }
-
-                let mut new_shape = result.shape.clone();
-                new_shape[i] = tgt_dim;
-                result = Self::from_vec(new_data, new_shape);
             }
+
+            let mut new_shape = result.shape.clone();
+            new_shape[i] = tgt_dim;
+            result = Self::from_vec(new_data, new_shape);
         }
+
         result
     }
 
@@ -173,7 +247,7 @@ impl Tensor {
                     }
                 }
                 Self::from_vec(result, vec![batch, m, n])
-            },
+            }
             (4, 4) => {
                 // 4D matmul for attention: [batch, heads, seq, dim] @ [batch, heads, dim, seq]
                 assert_eq!(self.shape[0], other.shape[0]); // batch
@@ -193,8 +267,10 @@ impl Tensor {
                             for j in 0..seq2 {
                                 let mut sum = 0.0;
                                 for k in 0..dim {
-                                    let idx1 = b * heads * seq1 * dim + h * seq1 * dim + i * dim + k;
-                                    let idx2 = b * heads * dim * seq2 + h * dim * seq2 + k * seq2 + j;
+                                    let idx1 =
+                                        b * heads * seq1 * dim + h * seq1 * dim + i * dim + k;
+                                    let idx2 =
+                                        b * heads * dim * seq2 + h * dim * seq2 + k * seq2 + j;
                                     sum += self.data[idx1] * other.data[idx2];
                                 }
                                 result.push(sum);
@@ -203,8 +279,11 @@ impl Tensor {
                     }
                 }
                 Self::from_vec(result, vec![batch, heads, seq1, seq2])
-            },
-            _ => panic!("Unsupported matmul dimensions: {:?} @ {:?}", self.shape, other.shape)
+            }
+            _ => panic!(
+                "Unsupported matmul dimensions: {:?} @ {:?}",
+                self.shape, other.shape
+            ),
         }
     }
 
@@ -232,69 +311,6 @@ impl Tensor {
         Self::from_vec(result, vec![m, n])
     }
 
-    pub fn add(&self, other: &Tensor) -> Tensor {
-        // Handle broadcasting
-        if self.shape == other.shape {
-            let data: Vec<f32> = self.data.iter()
-                .zip(other.data.iter())
-                .map(|(&a, &b)| a + b)
-                .collect();
-            Self::from_vec(data, self.shape.clone())
-        } else {
-            // broadcasting for bias addition
-            if other.shape.len() == 1 && other.shape[0] == self.shape[self.shape.len() - 1] {
-                let mut result = Vec::with_capacity(self.data.len());
-                let last_dim = self.shape[self.shape.len() - 1];
-                for (i, &val) in self.data.iter().enumerate() {
-                    result.push(val + other.data[i % last_dim]);
-                }
-                Self::from_vec(result, self.shape.clone())
-            } else {
-                let broadcasted = other.broadcast_to(&self.shape);
-                self.add(&broadcasted)
-            }
-        }
-    }
-
-    pub fn sub(&self, other: &Tensor) -> Tensor {
-        if self.shape == other.shape {
-            let data: Vec<f32> = self.data.iter()
-                .zip(other.data.iter())
-                .map(|(&a, &b)| a - b)
-                .collect();
-            Self::from_vec(data, self.shape.clone())
-        } else {
-            let broadcasted = other.broadcast_to(&self.shape);
-            self.sub(&broadcasted)
-        }
-    }
-
-    pub fn mul(&self, other: &Tensor) -> Tensor {
-        if self.shape == other.shape {
-            let data: Vec<f32> = self.data.iter()
-                .zip(other.data.iter())
-                .map(|(&a, &b)| a * b)
-                .collect();
-            Self::from_vec(data, self.shape.clone())
-        } else {
-            let broadcasted = other.broadcast_to(&self.shape);
-            self.mul(&broadcasted)
-        }
-    }
-
-    pub fn div(&self, other: &Tensor) -> Tensor {
-        if self.shape == other.shape {
-            let data: Vec<f32> = self.data.iter()
-                .zip(other.data.iter())
-                .map(|(&a, &b)| a / b)
-                .collect();
-            Self::from_vec(data, self.shape.clone())
-        } else {
-            let broadcasted = other.broadcast_to(&self.shape);
-            self.div(&broadcasted)
-        }
-    }
-
     pub fn add_scalar(&self, scalar: f32) -> Tensor {
         let data: Vec<f32> = self.data.iter().map(|&x| x + scalar).collect();
         Self::from_vec(data, self.shape.clone())
@@ -314,7 +330,213 @@ impl Tensor {
         let data: Vec<f32> = self.data.iter().map(|&x| x / scalar).collect();
         Self::from_vec(data, self.shape.clone())
     }
+    // Element-wise operations with tensors
+    pub fn add(&self, other: &Tensor) -> Tensor {
+        // Handle same shape - fast path
+        if self.shape == other.shape {
+            let data: Vec<f32> = self
+                .data
+                .iter()
+                .zip(other.data.iter())
+                .map(|(&a, &b)| a + b)
+                .collect();
+            return Self::from_vec(data, self.shape.clone());
+        }
 
+        // Handle bias addition: [batch, seq, hidden] + [hidden]
+        if other.shape.len() == 1 && self.shape.len() > 1 {
+            let last_dim = self.shape[self.shape.len() - 1];
+            if other.shape[0] == last_dim {
+                // Broadcast along last dimension
+                let mut result = Vec::with_capacity(self.data.len());
+                for (i, &val) in self.data.iter().enumerate() {
+                    result.push(val + other.data[i % last_dim]);
+                }
+                return Self::from_vec(result, self.shape.clone());
+            }
+        }
+
+        // Handle general broadcasting
+        let (broadcasted_self, broadcasted_other) = self.broadcast_with(other);
+        // Now both have same shape, use the fast path
+        let data: Vec<f32> = broadcasted_self
+            .data
+            .iter()
+            .zip(broadcasted_other.data.iter())
+            .map(|(&a, &b)| a + b)
+            .collect();
+        Self::from_vec(data, broadcasted_self.shape.clone())
+    }
+
+    pub fn sub(&self, other: &Tensor) -> Tensor {
+        if self.shape == other.shape {
+            let data: Vec<f32> = self
+                .data
+                .iter()
+                .zip(other.data.iter())
+                .map(|(&a, &b)| a - b)
+                .collect();
+            Self::from_vec(data, self.shape.clone())
+        } else if other.shape.len() == 1
+            && self.shape.len() > 1
+            && other.shape[0] == self.shape[self.shape.len() - 1]
+        {
+            // Fast path for bias-like subtraction
+            let last_dim = self.shape[self.shape.len() - 1];
+            let mut result = Vec::with_capacity(self.data.len());
+            for (i, &val) in self.data.iter().enumerate() {
+                result.push(val - other.data[i % last_dim]);
+            }
+            Self::from_vec(result, self.shape.clone())
+        } else {
+            let (broadcasted_self, broadcasted_other) = self.broadcast_with(other);
+            // Now both have same shape, use the fast path
+            let data: Vec<f32> = broadcasted_self
+                .data
+                .iter()
+                .zip(broadcasted_other.data.iter())
+                .map(|(&a, &b)| a - b)
+                .collect();
+            Self::from_vec(data, broadcasted_self.shape.clone())
+        }
+    }
+
+    pub fn mul(&self, other: &Tensor) -> Tensor {
+        if self.shape == other.shape {
+            let data: Vec<f32> = self
+                .data
+                .iter()
+                .zip(other.data.iter())
+                .map(|(&a, &b)| a * b)
+                .collect();
+            Self::from_vec(data, self.shape.clone())
+        } else if other.shape.len() == 1
+            && self.shape.len() > 1
+            && other.shape[0] == self.shape[self.shape.len() - 1]
+        {
+            // Fast path for element-wise multiplication with 1D tensor
+            let last_dim = self.shape[self.shape.len() - 1];
+            let mut result = Vec::with_capacity(self.data.len());
+            for (i, &val) in self.data.iter().enumerate() {
+                result.push(val * other.data[i % last_dim]);
+            }
+            Self::from_vec(result, self.shape.clone())
+        } else {
+            let (broadcasted_self, broadcasted_other) = self.broadcast_with(other);
+            // Now both have same shape, use the fast path
+            let data: Vec<f32> = broadcasted_self
+                .data
+                .iter()
+                .zip(broadcasted_other.data.iter())
+                .map(|(&a, &b)| a * b)
+                .collect();
+            Self::from_vec(data, broadcasted_self.shape.clone())
+        }
+    }
+
+    pub fn div(&self, other: &Tensor) -> Tensor {
+        if self.shape == other.shape {
+            let data: Vec<f32> = self
+                .data
+                .iter()
+                .zip(other.data.iter())
+                .map(|(&a, &b)| a / b)
+                .collect();
+            Self::from_vec(data, self.shape.clone())
+        } else if other.shape.len() == 1
+            && self.shape.len() > 1
+            && other.shape[0] == self.shape[self.shape.len() - 1]
+        {
+            // Fast path for element-wise division with 1D tensor
+            let last_dim = self.shape[self.shape.len() - 1];
+            let mut result = Vec::with_capacity(self.data.len());
+            for (i, &val) in self.data.iter().enumerate() {
+                result.push(val / other.data[i % last_dim]);
+            }
+            Self::from_vec(result, self.shape.clone())
+        } else {
+            let (broadcasted_self, broadcasted_other) = self.broadcast_with(other);
+            // Now both have same shape, use the fast path
+            let data: Vec<f32> = broadcasted_self
+                .data
+                .iter()
+                .zip(broadcasted_other.data.iter())
+                .map(|(&a, &b)| a / b)
+                .collect();
+            Self::from_vec(data, broadcasted_self.shape.clone())
+        }
+    }
+
+    // Helper for mutual broadcasting
+    fn broadcast_with(&self, other: &Tensor) -> (Tensor, Tensor) {
+        // Special case for attention masks: [batch, heads, seq, seq] + [batch, 1, 1, seq]
+        // The second tensor should broadcast to match the first
+
+        let max_dims = self.shape.len().max(other.shape.len());
+        let mut output_shape = vec![1; max_dims];
+
+        // Align shapes from the right
+        let self_offset = max_dims.saturating_sub(self.shape.len());
+        let other_offset = max_dims.saturating_sub(other.shape.len());
+
+        for i in 0..max_dims {
+            let self_dim = if i >= self_offset && i - self_offset < self.shape.len() {
+                self.shape[i - self_offset]
+            } else {
+                1
+            };
+
+            let other_dim = if i >= other_offset && i - other_offset < other.shape.len() {
+                other.shape[i - other_offset]
+            } else {
+                1
+            };
+
+            if self_dim == other_dim {
+                output_shape[i] = self_dim;
+            } else if self_dim == 1 {
+                output_shape[i] = other_dim;
+            } else if other_dim == 1 {
+                output_shape[i] = self_dim;
+            } else {
+                panic!(
+                    "Cannot broadcast shapes {:?} and {:?} at dimension {}: {} vs {}",
+                    self.shape, other.shape, i, self_dim, other_dim
+                );
+            }
+        }
+
+        // Broadcast both tensors to output shape
+        let broadcasted_self = if self.shape.len() < max_dims || self.shape != output_shape {
+            let mut reshaped = self.clone();
+            while reshaped.shape.len() < max_dims {
+                reshaped = reshaped.unsqueeze(0);
+            }
+            if reshaped.shape != output_shape {
+                reshaped.broadcast_to(&output_shape)
+            } else {
+                reshaped
+            }
+        } else {
+            self.clone()
+        };
+
+        let broadcasted_other = if other.shape.len() < max_dims || other.shape != output_shape {
+            let mut reshaped = other.clone();
+            while reshaped.shape.len() < max_dims {
+                reshaped = reshaped.unsqueeze(0);
+            }
+            if reshaped.shape != output_shape {
+                reshaped.broadcast_to(&output_shape)
+            } else {
+                reshaped
+            }
+        } else {
+            other.clone()
+        };
+
+        (broadcasted_self, broadcasted_other)
+    }
     pub fn relu(&self) -> Tensor {
         let data: Vec<f32> = self.data.iter().map(|&x| x.max(0.0)).collect();
         Self::from_vec(data, self.shape.clone())
@@ -322,10 +544,14 @@ impl Tensor {
 
     pub fn gelu(&self) -> Tensor {
         // GELU approximation: x * 0.5 * (1.0 + tanh(sqrt(2.0 / π) * (x + 0.044715 * x^3)))
-        let data: Vec<f32> = self.data.iter().map(|&x| {
-            let inner = (2.0_f32 / std::f32::consts::PI).sqrt() * (x + 0.044715 * x.powi(3));
-            x * 0.5 * (1.0 + inner.tanh())
-        }).collect();
+        let data: Vec<f32> = self
+            .data
+            .iter()
+            .map(|&x| {
+                let inner = (2.0_f32 / std::f32::consts::PI).sqrt() * (x + 0.044715 * x.powi(3));
+                x * 0.5 * (1.0 + inner.tanh())
+            })
+            .collect();
         Self::from_vec(data, self.shape.clone())
     }
 
@@ -335,12 +561,20 @@ impl Tensor {
     }
 
     pub fn sigmoid(&self) -> Tensor {
-        let data: Vec<f32> = self.data.iter().map(|&x| 1.0 / (1.0 + (-x).exp())).collect();
+        let data: Vec<f32> = self
+            .data
+            .iter()
+            .map(|&x| 1.0 / (1.0 + (-x).exp()))
+            .collect();
         Self::from_vec(data, self.shape.clone())
     }
 
     pub fn softmax(&self, dim: i32) -> Tensor {
-        let dim = if dim < 0 { self.shape.len() as i32 + dim } else { dim } as usize;
+        let dim = if dim < 0 {
+            self.shape.len() as i32 + dim
+        } else {
+            dim
+        } as usize;
 
         // 2D tensors
         if self.shape.len() == 2 && dim == 1 {
@@ -370,7 +604,7 @@ impl Tensor {
 
         let dim_size = self.shape[dim];
         let outer_size: usize = self.shape[..dim].iter().product();
-        let inner_size: usize = self.shape[dim+1..].iter().product();
+        let inner_size: usize = self.shape[dim + 1..].iter().product();
 
         let mut result = vec![0.0; self.data.len()];
 
@@ -417,9 +651,8 @@ impl Tensor {
 
             // compute mean and variance
             let mean: f32 = slice.iter().sum::<f32>() / norm_size as f32;
-            let variance: f32 = slice.iter()
-                .map(|&x| (x - mean).powi(2))
-                .sum::<f32>() / norm_size as f32;
+            let variance: f32 =
+                slice.iter().map(|&x| (x - mean).powi(2)).sum::<f32>() / norm_size as f32;
 
             // Normalize
             let std = (variance + eps).sqrt();
@@ -469,11 +702,15 @@ impl Tensor {
     }
 
     fn sum_single_dim(&self, dim: i32, keepdim: bool) -> Tensor {
-        let dim = if dim < 0 { self.shape.len() as i32 + dim } else { dim } as usize;
+        let dim = if dim < 0 {
+            self.shape.len() as i32 + dim
+        } else {
+            dim
+        } as usize;
 
         let dim_size = self.shape[dim];
         let outer_size: usize = self.shape[..dim].iter().product();
-        let inner_size: usize = self.shape[dim+1..].iter().product();
+        let inner_size: usize = self.shape[dim + 1..].iter().product();
 
         let mut result = Vec::with_capacity(outer_size * inner_size);
 
@@ -501,7 +738,11 @@ impl Tensor {
     pub fn mean(&self, dims: &[i32], keepdim: bool) -> Tensor {
         let sum = self.sum(dims, keepdim);
         let count = dims.iter().fold(1, |acc, &d| {
-            let dim = if d < 0 { self.shape.len() as i32 + d } else { d } as usize;
+            let dim = if d < 0 {
+                self.shape.len() as i32 + d
+            } else {
+                d
+            } as usize;
             acc * self.shape[dim]
         });
         sum.div_scalar(count as f32)
@@ -518,11 +759,15 @@ impl Tensor {
     }
 
     fn max_single_dim(&self, dim: i32, keepdim: bool) -> Tensor {
-        let dim = if dim < 0 { self.shape.len() as i32 + dim } else { dim } as usize;
+        let dim = if dim < 0 {
+            self.shape.len() as i32 + dim
+        } else {
+            dim
+        } as usize;
 
         let dim_size = self.shape[dim];
         let outer_size: usize = self.shape[..dim].iter().product();
-        let inner_size: usize = self.shape[dim+1..].iter().product();
+        let inner_size: usize = self.shape[dim + 1..].iter().product();
 
         let mut result = Vec::with_capacity(outer_size * inner_size);
 
@@ -583,22 +828,51 @@ impl Tensor {
     }
 
     pub fn gather(&self, dim: usize, indices: &Tensor) -> Tensor {
-        // assumes dim=0 and 2D weight matrix
         if dim == 0 && self.shape.len() == 2 {
-            let mut output_data = Vec::new();
-            for &idx in indices.data.iter() {
-                let idx = idx as usize;
-                let start = idx * self.shape[1];
-                let end = start + self.shape[1];
-                output_data.extend_from_slice(&self.data[start..end]);
-            }
+            // Handle both 1D and 2D indices for embedding lookup
+            if indices.shape.len() == 1 {
+                // 1D indices: [seq_len] -> [seq_len, hidden_size]
+                let mut output_data = Vec::new();
+                for &idx in indices.data.iter() {
+                    let idx = idx as usize;
+                    if idx >= self.shape[0] {
+                        panic!(
+                            "Index {} out of bounds for vocabulary size {}",
+                            idx, self.shape[0]
+                        );
+                    }
+                    let start = idx * self.shape[1];
+                    let end = start + self.shape[1];
+                    output_data.extend_from_slice(&self.data[start..end]);
+                }
+                return Self::from_vec(output_data, vec![indices.shape[0], self.shape[1]]);
+            } else if indices.shape.len() == 2 {
+                // 2D indices: [batch, seq_len] -> [batch, seq_len, hidden_size]
+                let batch_size = indices.shape[0];
+                let seq_len = indices.shape[1];
+                let hidden_size = self.shape[1];
+                let mut output_data = Vec::with_capacity(batch_size * seq_len * hidden_size);
 
-            let mut output_shape = indices.shape.clone();
-            output_shape.push(self.shape[1]);
-            return Self::from_vec(output_data, output_shape);
+                for &idx in indices.data.iter() {
+                    let idx = idx as usize;
+                    if idx >= self.shape[0] {
+                        panic!(
+                            "Index {} out of bounds for vocabulary size {}",
+                            idx, self.shape[0]
+                        );
+                    }
+                    let start = idx * hidden_size;
+                    let end = start + hidden_size;
+                    output_data.extend_from_slice(&self.data[start..end]);
+                }
+                return Self::from_vec(output_data, vec![batch_size, seq_len, hidden_size]);
+            }
         }
 
-        panic!("General gather  implemented");
+        panic!(
+            "Gather not implemented for dim={} with shapes self={:?}, indices={:?}",
+            dim, self.shape, indices.shape
+        );
     }
 
     pub fn slice(&self, ranges: &[Range<usize>]) -> Tensor {
@@ -610,13 +884,29 @@ impl Tensor {
         }
 
         let mut result = Vec::new();
-        self.slice_recursive(&mut result, &self.data, &self.shape, &self.strides, ranges, 0, 0);
+        self.slice_recursive(
+            &mut result,
+            &self.data,
+            &self.shape,
+            &self.strides,
+            ranges,
+            0,
+            0,
+        );
 
         Self::from_vec(result, new_shape)
     }
 
-    fn slice_recursive(&self, result: &mut Vec<f32>, data: &[f32], shape: &[usize],
-                       strides: &[usize], ranges: &[Range<usize>], dim: usize, offset: usize) {
+    fn slice_recursive(
+        &self,
+        result: &mut Vec<f32>,
+        data: &[f32],
+        shape: &[usize],
+        strides: &[usize],
+        ranges: &[Range<usize>],
+        dim: usize,
+        offset: usize,
+    ) {
         if dim == shape.len() {
             result.push(data[offset]);
             return;
@@ -691,6 +981,6 @@ pub trait Attention {
         q: &Tensor,
         k: &Tensor,
         v: &Tensor,
-        mask: Option<&Tensor>
+        mask: Option<&Tensor>,
     ) -> Tensor;
 }
