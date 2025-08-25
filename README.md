@@ -1,5 +1,7 @@
 # Vectorize
 
+WIP
+
 A solution to create embeddings using Minilm-l6-v2, although the archtecture does
 support all BERT models.
 
